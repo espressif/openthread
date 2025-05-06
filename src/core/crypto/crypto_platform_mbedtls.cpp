@@ -78,11 +78,6 @@ static constexpr uint16_t kEntropyMinThreshold = 16;
 #endif
 #endif
 
-OT_TOOL_WEAK void otPlatCryptoInit(void)
-{
-    // Intentionally empty.
-}
-
 // AES  Implementation
 OT_TOOL_WEAK otError otPlatCryptoAesInit(otCryptoContext *aContext)
 {

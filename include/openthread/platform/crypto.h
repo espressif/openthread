@@ -216,11 +216,6 @@ typedef struct otPlatCryptoEcdsaSignature otPlatCryptoEcdsaSignature;
 #define OT_CRYPTO_PBDKF2_MAX_SALT_SIZE 30
 
 /**
- * Initialize the Crypto module.
- */
-void otPlatCryptoInit(void);
-
-/**
  * Import a key into PSA ITS.
  *
  * @param[in,out] aKeyRef           Pointer to the key ref to be used for crypto operations.
