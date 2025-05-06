@@ -200,8 +200,6 @@ exit:
     return error;
 }
 
-OT_TOOL_WEAK void otPlatCryptoInit(void) { psa_crypto_init(); }
-
 OT_TOOL_WEAK otError otPlatCryptoImportKey(otCryptoKeyRef      *aKeyRef,
                                            otCryptoKeyType      aKeyType,
                                            otCryptoKeyAlgorithm aKeyAlgorithm,
