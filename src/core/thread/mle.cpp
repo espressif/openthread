@@ -80,18 +80,9 @@ Mle::Mle(Instance &aInstance)
     , mWedAttachTimer(aInstance)
 #endif
 #if OPENTHREAD_FTD
-    , mRouterEligible(true)
-    , mRouterRoleAllowed(true)
-    , mBlockDowngrade(false)
     , mAddressSolicitPending(false)
     , mAddressSolicitRejected(false)
-#if OPENTHREAD_CONFIG_REFERENCE_DEVICE_ENABLE
-    , mCcmEnabled(false)
-    , mThreadVersionCheckEnabled(true)
-#endif
     , mNetworkIdTimeout(kNetworkIdTimeout)
-    , mRouterUpgradeThreshold(kRouterUpgradeThreshold)
-    , mRouterDowngradeThreshold(kRouterDowngradeThreshold)
     , mPreviousPartitionRouterIdSequence(0)
     , mPreviousPartitionIdTimeout(0)
     , mChildRouterLinks(kChildRouterLinks)
@@ -108,6 +99,7 @@ Mle::Mle(Instance &aInstance)
     , mAdvertiseTrickleTimer(aInstance, Mle::HandleAdvertiseTrickleTimer)
     , mChildTable(aInstance)
     , mRouterTable(aInstance)
+    , mRoleTransitioner(aInstance)
 #endif // OPENTHREAD_FTD
 #if OPENTHREAD_CONFIG_P2P_ENABLE
     , mP2p(aInstance)
@@ -455,7 +447,7 @@ void Mle::Restore(void)
     mHasRestored = true;
 
 #if OPENTHREAD_FTD
-    UpdateRouterRoleAllowed(kReasonMleInit);
+    mRoleTransitioner.UpdateRouterRoleAllowed(RoleTransitioner::kReasonMleInit);
 #endif
 
 exit:
@@ -606,7 +598,7 @@ void Mle::SetStateDetached(void)
     Get<MeshForwarder>().SetRxOnWhenIdle(true);
     Get<Mac::Mac>().SetBeaconEnabled(false);
 #if OPENTHREAD_FTD
-    mBlockDowngrade = false;
+    mRoleTransitioner.SetDowngradeBlocked(false);
     ClearAlternateRloc16();
     HandleDetachStart();
 #endif
@@ -727,7 +719,7 @@ Error Mle::SetDeviceMode(DeviceMode aDeviceMode)
         ClearAlternateRloc16();
     }
 
-    UpdateRouterRoleAllowed(kReasonDeviceModeChanged);
+    mRoleTransitioner.UpdateRouterRoleAllowed(RoleTransitioner::kReasonDeviceModeChanged);
 #endif
 
     if (IsAttached())
@@ -1052,21 +1044,23 @@ void Mle::HandleNotifierEvents(Events aEvents)
 #if OPENTHREAD_FTD
     if (aEvents.Contains(kEventSecurityPolicyChanged))
     {
-        UpdateRouterRoleAllowed(kReasonSecurityPolicyChanged);
+        mRoleTransitioner.UpdateRouterRoleAllowed(RoleTransitioner::kReasonSecurityPolicyChanged);
     }
 
-    if (mBlockDowngrade && aEvents.Contains(kEventThreadChildRemoved))
+    if (mRoleTransitioner.IsDowngradeBlocked() && aEvents.Contains(kEventThreadChildRemoved))
     {
-        mBlockDowngrade = false;
+        bool shouldBlock = false;
 
         for (const Child &child : Get<ChildTable>().Iterate(Child::kInStateValid))
         {
             if (child.IsBlockingParentDowngrade())
             {
-                mBlockDowngrade = true;
+                shouldBlock = true;
                 break;
             }
         }
+
+        mRoleTransitioner.SetDowngradeBlocked(shouldBlock);
     }
 #endif
 

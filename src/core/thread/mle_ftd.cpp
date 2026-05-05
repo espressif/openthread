@@ -76,12 +76,12 @@ void Mle::HandlePartitionChange(void)
     mRouterTable.Clear();
 }
 
-bool Mle::DetermineIfRouterRoleAllowed(void) const
+bool Mle::RoleTransitioner::DetermineIfRouterRoleAllowed(void) const
 {
     bool                  allowed   = false;
     const SecurityPolicy &secPolicy = Get<KeyManager>().GetSecurityPolicy();
 
-    VerifyOrExit(mRouterEligible && IsFullThreadDevice());
+    VerifyOrExit(mRouterEligible && Get<Mle>().IsFullThreadDevice());
 
 #if OPENTHREAD_CONFIG_THREAD_VERSION == OT_THREAD_VERSION_1_1
     VerifyOrExit(secPolicy.mRoutersEnabled);
@@ -116,14 +116,14 @@ exit:
     return allowed;
 }
 
-void Mle::UpdateRouterRoleAllowed(UpdateRouterRoleAllowedReason aReason)
+void Mle::RoleTransitioner::UpdateRouterRoleAllowed(UpdateRouterRoleAllowedReason aReason)
 {
     bool allowed = DetermineIfRouterRoleAllowed();
 
     VerifyOrExit(allowed != mRouterRoleAllowed);
     mRouterRoleAllowed = allowed;
 
-    if (IsAttached())
+    if (Get<Mle>().IsAttached())
     {
         Get<Mac::Mac>().SetBeaconEnabled(mRouterRoleAllowed);
     }
@@ -131,12 +131,12 @@ void Mle::UpdateRouterRoleAllowed(UpdateRouterRoleAllowedReason aReason)
     // Take action based on the current role, the new `mRouterRoleAllowed`,
     // and the reason for the change.
 
-    if (IsChild() && mRouterRoleAllowed && (aReason == kReasonConfigParameterChanged))
+    if (Get<Mle>().IsChild() && mRouterRoleAllowed && (aReason == kReasonConfigParameterChanged))
     {
-        mRouterRoleTransition.StartTimeout();
+        StartTimeout();
     }
 
-    if (IsRouterOrLeader())
+    if (Get<Mle>().IsRouterOrLeader())
     {
         // If currently acting as router or leader, but the config or
         // security policy changes such that the router role is no
@@ -157,16 +157,16 @@ void Mle::UpdateRouterRoleAllowed(UpdateRouterRoleAllowedReason aReason)
             break;
 
         case kReasonConfigParameterChanged:
-            IgnoreError(BecomeDetached());
+            IgnoreError(Get<Mle>().BecomeDetached());
             break;
 
         case kReasonSecurityPolicyChanged:
-            VerifyOrExit(!mRouterRoleTransition.IsPending());
-            mRouterRoleTransition.StartTimeout();
+            VerifyOrExit(!IsTransitionPending());
+            StartTimeout();
 
-            if (IsLeader())
+            if (Get<Mle>().IsLeader())
             {
-                mRouterRoleTransition.IncreaseTimeout(kLeaderDowngradeExtraDelay);
+                IncreaseTimeout(kLeaderDowngradeExtraDelay);
             }
             break;
         }
@@ -176,11 +176,11 @@ exit:
     return;
 }
 
-Error Mle::SetRouterEligible(bool aEligible)
+Error Mle::RoleTransitioner::SetRouterEligible(bool aEligible)
 {
     Error error = kErrorNone;
 
-    if (!IsFullThreadDevice())
+    if (!Get<Mle>().IsFullThreadDevice())
     {
         VerifyOrExit(!aEligible, error = kErrorNotCapable);
     }
@@ -195,13 +195,13 @@ exit:
 }
 
 #if OPENTHREAD_CONFIG_REFERENCE_DEVICE_ENABLE
-void Mle::SetCcmEnabled(bool aEnabled)
+void Mle::RoleTransitioner::SetCcmEnabled(bool aEnabled)
 {
     mCcmEnabled = aEnabled;
     UpdateRouterRoleAllowed(kReasonConfigParameterChanged);
 }
 
-void Mle::SetThreadVersionCheckEnabled(bool aEnabled)
+void Mle::RoleTransitioner::SetThreadVersionCheckEnabled(bool aEnabled)
 {
     mThreadVersionCheckEnabled = aEnabled;
     UpdateRouterRoleAllowed(kReasonConfigParameterChanged);
@@ -241,7 +241,7 @@ Error Mle::BecomeRouter(RouterUpgradeReason aReason)
     LogInfo("Attempt to become router, reason:%s", RouterUpgradeReasonToString(aReason));
 
     Get<MeshForwarder>().SetRxOnWhenIdle(true);
-    mRouterRoleTransition.StopTimeout();
+    mRoleTransitioner.StopTimeout();
 
     error = SendAddressSolicit(aReason);
 
@@ -341,7 +341,7 @@ void Mle::HandleChildStart(void)
 {
     mAddressSolicitRejected = false;
 
-    mRouterRoleTransition.StartTimeout();
+    mRoleTransitioner.StartTimeout();
 
     StopLeader();
     Get<TimeTicker>().RegisterReceiver(TimeTicker::kMle);
@@ -409,7 +409,7 @@ void Mle::HandleChildStart(void)
 
 exit:
 
-    if (mRouterTable.GetActiveRouterCount() >= mRouterUpgradeThreshold &&
+    if (!mRoleTransitioner.IsRouterCountBelowUpgradeThreshold() &&
         (!IsRouterIdValid(mPreviousRouterId) || !HasChildren()))
     {
         SetRouterId(kInvalidRouterId);
@@ -515,7 +515,7 @@ void Mle::HandleRouterTableEvent(RouterTable::Events aEvents)
 
     if (aEvents & RouterTable::kEventRouterAdded)
     {
-        mBlockDowngrade = false;
+        mRoleTransitioner.SetDowngradeBlocked(false);
     }
 
     if (IsRouterOrLeader() && mAdvertiseTrickleTimer.IsRunning())
@@ -1305,12 +1305,9 @@ Error Mle::HandleAdvertisementOnFtd(RxInfo &aRxInfo, uint16_t aSourceAddress, co
                 ExitNow(error = kErrorDetached);
             }
 
-            if (!mRouterRoleTransition.IsPending() && (mRouterTable.GetActiveRouterCount() < mRouterUpgradeThreshold))
-            {
-                mRouterRoleTransition.StartTimeout();
-            }
-
             mRouterTable.UpdateRouterOnFtdChild(routeTlv, routerId);
+
+            mRoleTransitioner.DecideWhetherToUpgrade();
         }
         else
         {
@@ -1331,12 +1328,12 @@ Error Mle::HandleAdvertisementOnFtd(RxInfo &aRxInfo, uint16_t aSourceAddress, co
     }
 
     //- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-    // Update routers as a router or leader.
+    // Inform `RoleTransitioner` to decide whether we need to downgrade
 
-    if (IsRouter() && ShouldDowngrade(routerId, routeTlv))
-    {
-        mRouterRoleTransition.StartTimeout();
-    }
+    mRoleTransitioner.DecideWhetherToDowngrade(routerId, routeTlv);
+
+    //- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+    // Update routers as a router or leader.
 
     router = mRouterTable.FindRouterById(routerId);
     VerifyOrExit(router != nullptr);
@@ -1589,55 +1586,7 @@ void Mle::HandleTimeTick(void)
     //- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
     // Role transitions
 
-    if (mRouterRoleTransition.HandleTimeTick())
-    {
-        // `mRouterRoleTransition.HandleTimeTick()` returns `true`
-        // if role transition timeout expires.
-
-        switch (mRole)
-        {
-        case kRoleDisabled:
-        case kRoleDetached:
-            break;
-
-        case kRoleChild:
-            if (mRouterTable.GetActiveRouterCount() < mRouterUpgradeThreshold && HasNeighborWithGoodLinkQuality())
-            {
-                IgnoreError(BecomeRouter(kReasonTooFewRouters));
-            }
-            else
-            {
-                mAnnounceHandler.HandleRouterRoleTransitionAttemptDone();
-            }
-
-            if (!mAdvertiseTrickleTimer.IsRunning())
-            {
-                SendMulticastAdvertisement();
-
-                mAdvertiseTrickleTimer.Start(TrickleTimer::kModePlainTimer, kReedAdvIntervalMin, kReedAdvIntervalMax);
-            }
-
-            break;
-
-        case kRoleRouter:
-            if (mRouterTable.GetActiveRouterCount() > mRouterDowngradeThreshold)
-            {
-                LogNote("Downgrade to REED");
-                mAttacher.Attach(kDowngradeToReed);
-            }
-
-            OT_FALL_THROUGH;
-
-        case kRoleLeader:
-            if (!IsRouterRoleAllowed())
-            {
-                LogInfo("Router role no longer allowed");
-                IgnoreError(BecomeDetached());
-            }
-
-            break;
-        }
-    }
+    mRoleTransitioner.HandleTimeTick();
 
     //- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
     // Check Leader's age
@@ -3485,13 +3434,13 @@ void Mle::HandleAddressSolicitResponse(Coap::Msg *aMsg, Error aResult)
         // router from downgrading back to a REED to ensure this
         // child remains connected.
         //
-        // The `mBlockDowngrade` is cleared in various situations:
+        // The `DowngradeBlocked` is cleared in various situations:
         // - From `SetStateDetached()` (e.g. partition change).
         // - If a new router is added (new possible parent).
         // - If all children blocking downgrade are disconnected.
 
         child.SetBlockParentDowngrade(true);
-        mBlockDowngrade = true;
+        mRoleTransitioner.SetDowngradeBlocked(true);
     }
 
 exit:
@@ -3508,18 +3457,18 @@ exit:
     return error;
 }
 
-bool Mle::WillBecomeRouterSoon(void) const
+bool Mle::RoleTransitioner::WillBecomeRouterSoon(void) const
 {
     static constexpr uint8_t kMaxDelay = 10;
 
     bool willBecomeRouter = false;
 
-    VerifyOrExit(IsRouterRoleAllowed() && IsChild());
-    VerifyOrExit(!mAddressSolicitRejected);
+    VerifyOrExit(IsRouterRoleAllowed() && Get<Mle>().IsChild());
+    VerifyOrExit(!Get<Mle>().mAddressSolicitRejected);
 
-    if (!mAddressSolicitPending)
+    if (!Get<Mle>().mAddressSolicitPending)
     {
-        VerifyOrExit(mRouterRoleTransition.IsPending() && mRouterRoleTransition.GetTimeout() <= kMaxDelay);
+        VerifyOrExit(IsTransitionPending() && GetTimeout() <= kMaxDelay);
     }
 
     willBecomeRouter = true;
@@ -3597,7 +3546,7 @@ void Mle::ProcessAddressSolicit(AddrSolicitInfo &aInfo)
     switch (aInfo.mReason)
     {
     case kReasonTooFewRouters:
-        VerifyOrExit(mRouterTable.GetActiveRouterCount() < mRouterUpgradeThreshold);
+        VerifyOrExit(mRoleTransitioner.IsRouterCountBelowUpgradeThreshold());
         break;
 
     case kReasonHaveChildIdRequest:
@@ -3605,7 +3554,7 @@ void Mle::ProcessAddressSolicit(AddrSolicitInfo &aInfo)
         break;
 
     case kReasonBorderRouterRequest:
-        if ((mRouterTable.GetActiveRouterCount() >= mRouterUpgradeThreshold) &&
+        if (!mRoleTransitioner.IsRouterCountBelowUpgradeThreshold() &&
             (Get<NetworkData::Leader>().CountBorderRouters(NetworkData::kRouterRoleOnly) >=
              kRouterUpgradeBorderRouterRequestThreshold))
         {
@@ -3781,30 +3730,29 @@ void Mle::FillConnectivityTlvValue(ConnectivityTlvValue &aTlvValue) const
     aTlvValue.InitFrom(connectivity);
 }
 
-bool Mle::ShouldDowngrade(uint8_t aNeighborId, const RouteTlv &aRouteTlv) const
+void Mle::RoleTransitioner::DecideWhetherToDowngrade(uint8_t aNeighborId, const RouteTlv &aRouteTlv)
 {
     // Determine whether all conditions are satisfied for the router
     // to downgrade after receiving info for a neighboring router
     // with Router ID `aNeighborId` along with its `aRouteTlv`.
 
-    bool    shouldDowngrade   = false;
-    uint8_t activeRouterCount = mRouterTable.GetActiveRouterCount();
+    uint8_t activeRouterCount = Get<RouterTable>().GetActiveRouterCount();
     uint8_t count;
 
-    VerifyOrExit(IsRouter());
-    VerifyOrExit(mRouterTable.IsAllocated(aNeighborId));
-    VerifyOrExit(!mBlockDowngrade);
+    VerifyOrExit(Get<Mle>().IsRouter());
+    VerifyOrExit(Get<RouterTable>().IsAllocated(aNeighborId));
+    VerifyOrExit(!mDowngradeBlocked);
 
-    VerifyOrExit(!mRouterRoleTransition.IsPending());
+    VerifyOrExit(!IsTransitionPending());
 
-    VerifyOrExit(activeRouterCount > mRouterDowngradeThreshold);
+    VerifyOrExit(activeRouterCount > mDowngradeThreshold);
 
     // Check that we have at least `kMinDowngradeNeighbors`
     // neighboring routers with two-way link quality of 2 or better.
 
     count = 0;
 
-    for (const Router &router : mRouterTable)
+    for (const Router &router : Get<RouterTable>())
     {
         if (!router.IsStateValid() || (router.GetTwoWayLinkQuality() < kLinkQuality2))
         {
@@ -3823,28 +3771,29 @@ bool Mle::ShouldDowngrade(uint8_t aNeighborId, const RouteTlv &aRouteTlv) const
 
     // Check that we have fewer children than three times the number
     // of excess routers (defined as the difference between number of
-    // active routers and `mRouterDowngradeThreshold`).
+    // active routers and `mDowngradeThreshold`).
 
-    count = activeRouterCount - mRouterDowngradeThreshold;
-    VerifyOrExit(mChildTable.GetNumChildren(Child::kInStateValid) < count * 3);
+    count = activeRouterCount - mDowngradeThreshold;
+    VerifyOrExit(Get<ChildTable>().GetNumChildren(Child::kInStateValid) < count * 3);
 
     // Check that the neighbor has as good or better-quality links to
     // same routers.
 
-    VerifyOrExit(NeighborHasComparableConnectivity(aRouteTlv, aNeighborId));
+    VerifyOrExit(NeighborHasComparableConnectivity(aNeighborId, aRouteTlv));
 
 #if OPENTHREAD_CONFIG_BORDER_ROUTER_ENABLE && OPENTHREAD_CONFIG_BORDER_ROUTER_REQUEST_ROUTER_ROLE
     // Check if we are eligible to be router due to being a BR.
     VerifyOrExit(!Get<NetworkData::Notifier>().IsEligibleForRouterRoleUpgradeAsBorderRouter());
 #endif
 
-    shouldDowngrade = true;
+    // All conditions are satisfied to start downgrade.
+    StartTimeout();
 
 exit:
-    return shouldDowngrade;
+    return;
 }
 
-bool Mle::NeighborHasComparableConnectivity(const RouteTlv &aRouteTlv, uint8_t aNeighborId) const
+bool Mle::RoleTransitioner::NeighborHasComparableConnectivity(uint8_t aNeighborId, const RouteTlv &aRouteTlv) const
 {
     // Check whether the neighboring router with Router ID `aNeighborId`
     // (along with its `aRouteTlv`) has as good or better-quality links
@@ -3860,12 +3809,12 @@ bool Mle::NeighborHasComparableConnectivity(const RouteTlv &aRouteTlv, uint8_t a
         LinkQuality   localLinkQuality;
         LinkQuality   peerLinkQuality;
 
-        if ((routerId == mRouterId) || (routerId == aNeighborId))
+        if ((routerId == Get<Mle>().mRouterId) || (routerId == aNeighborId))
         {
             continue;
         }
 
-        router = mRouterTable.FindRouterById(routerId);
+        router = Get<RouterTable>().FindRouterById(routerId);
 
         if ((router == nullptr) || !router->IsStateValid())
         {
@@ -4017,26 +3966,102 @@ const char *Mle::RouterUpgradeReasonToString(uint8_t aReason)
 #endif // OT_SHOULD_LOG_AT(OT_LOG_LEVEL_INFO)
 
 //----------------------------------------------------------------------------------------------------------------------
-// RouterRoleTransition
+// RoleTransitioner
 
-Mle::RouterRoleTransition::RouterRoleTransition(void)
-    : mTimeout(0)
+Mle::RoleTransitioner::RoleTransitioner(Instance &aInstance)
+    : InstanceLocator(aInstance)
+    , mRouterEligible(true)
+    , mRouterRoleAllowed(true)
+    , mDowngradeBlocked(false)
+#if OPENTHREAD_CONFIG_REFERENCE_DEVICE_ENABLE
+    , mCcmEnabled(false)
+    , mThreadVersionCheckEnabled(true)
+#endif
+    , mTimeout(0)
     , mJitter(kRouterSelectionJitter)
+    , mUpgradeThreshold(kRouterUpgradeThreshold)
+    , mDowngradeThreshold(kRouterDowngradeThreshold)
+
 {
 }
 
-void Mle::RouterRoleTransition::StartTimeout(void) { mTimeout = 1 + Random::NonCrypto::GetUint8InRange(0, mJitter); }
+void Mle::RoleTransitioner::StartTimeout(void) { mTimeout = 1 + Random::NonCrypto::GetUint8InRange(0, mJitter); }
 
-bool Mle::RouterRoleTransition::HandleTimeTick(void)
+bool Mle::RoleTransitioner::IsRouterCountBelowUpgradeThreshold(void) const
 {
-    bool expired = false;
+    return Get<RouterTable>().GetActiveRouterCount() < mUpgradeThreshold;
+}
 
-    VerifyOrExit(mTimeout > 0);
-    mTimeout--;
-    expired = (mTimeout == 0);
+void Mle::RoleTransitioner::DecideWhetherToUpgrade(void)
+{
+    VerifyOrExit(Get<Mle>().IsChild());
+
+    VerifyOrExit(IsRouterRoleAllowed());
+
+    VerifyOrExit(!IsTransitionPending());
+    VerifyOrExit(IsRouterCountBelowUpgradeThreshold());
+
+    StartTimeout();
 
 exit:
-    return expired;
+    return;
+}
+
+void Mle::RoleTransitioner::HandleTimeTick(void)
+{
+    VerifyOrExit(mTimeout > 0);
+    mTimeout--;
+
+    VerifyOrExit(mTimeout == 0);
+
+    // Timeout expired
+
+    switch (Get<Mle>().mRole)
+    {
+    case kRoleDisabled:
+    case kRoleDetached:
+        break;
+
+    case kRoleChild:
+        if (IsRouterCountBelowUpgradeThreshold() && Get<Mle>().HasNeighborWithGoodLinkQuality())
+        {
+            IgnoreError(Get<Mle>().BecomeRouter(kReasonTooFewRouters));
+        }
+        else
+        {
+            Get<Mle>().mAnnounceHandler.HandleRouterRoleTransitionAttemptDone();
+        }
+
+        if (!Get<Mle>().mAdvertiseTrickleTimer.IsRunning())
+        {
+            Get<Mle>().SendMulticastAdvertisement();
+            Get<Mle>().mAdvertiseTrickleTimer.Start(TrickleTimer::kModePlainTimer, kReedAdvIntervalMin,
+                                                    kReedAdvIntervalMax);
+        }
+
+        break;
+
+    case kRoleRouter:
+        if (Get<RouterTable>().GetActiveRouterCount() > mDowngradeThreshold)
+        {
+            LogNote("Downgrade to REED");
+            Get<Mle>().mAttacher.Attach(kDowngradeToReed);
+        }
+
+        OT_FALL_THROUGH;
+
+    case kRoleLeader:
+        if (!IsRouterRoleAllowed())
+        {
+            LogInfo("Router role no longer allowed");
+            IgnoreError(Get<Mle>().BecomeDetached());
+        }
+
+        break;
+    }
+
+exit:
+    return;
 }
 
 } // namespace Mle
